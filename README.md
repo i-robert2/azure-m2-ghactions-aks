@@ -177,6 +177,8 @@ Real problems from wiring this pipeline up for real — the root-cause/fix is th
 
 ## Cost
 
+0–3 €/mo on top of M1 (Actions free on public repos, Kyverno + Sonar + Sigstore free, signatures negligible). Deploy-verify-destroy ~€1–2; `terraform destroy` returns spend to ~€0.
+
 ---
 
 ## License
