@@ -1,0 +1,5 @@
+apiVersion: v2
+name: notes
+version: 0.1.0
+appVersion: "0.1.0"
+description: M1 three-tier notes app (React frontend, Node API, PostgreSQL)

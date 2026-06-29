@@ -1,0 +1,212 @@
+name: cd
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  HELM_VERSION: "v3.15.4"
+  KUBECTL_VERSION: "v1.30.0"
+
+jobs:
+  # ---------- 1. Lint + test + SonarCloud ----------
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # SonarCloud needs full history
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: app/api/package-lock.json
+      - name: API install + build + test
+        working-directory: app/api
+        run: |
+          npm ci
+          npm run build
+          npm test
+      - name: Frontend install + build
+        working-directory: app/frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with: { version: "${{ env.HELM_VERSION }}" }
+      - name: helm lint
+        run: helm lint charts/notes
+      - name: kube-linter
+        uses: stackrox/kube-linter-action@v1
+        with:
+          directory: charts/notes
+          config: .kube-linter.yaml
+
+      - name: SonarCloud scan
+        uses: SonarSource/sonarqube-scan-action@v4
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # ---------- 2. SAST + SBOM ----------
+  trivy-fs:
+    runs-on: ubuntu-latest
+    needs: lint-test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+      - name: Trivy SBOM (cyclonedx)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: cyclonedx
+          output: sbom.cdx.json
+      - uses: actions/upload-artifact@v4
+        with: { name: sbom, path: sbom.cdx.json }
+
+  # ---------- 3. PR: helm template only ----------
+  helm-template:
+    runs-on: ubuntu-latest
+    needs: lint-test
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with: { version: "${{ env.HELM_VERSION }}" }
+      - name: helm template
+        run: |
+          helm template notes ./charts/notes \
+            --set image.repository=${{ vars.ACR_NAME }}.azurecr.io \
+            --set frontend.tag=PR-${{ github.event.pull_request.number }} \
+            --set api.tag=PR-${{ github.event.pull_request.number }} \
+            --set ingress.host=pr.example.sslip.io \
+            > rendered.yaml
+      - uses: actions/upload-artifact@v4
+        with: { name: rendered-helm, path: rendered.yaml }
+
+  # ---------- 4. Build, push, sign, scan ----------
+  build:
+    runs-on: ubuntu-latest
+    needs: trivy-fs
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      api_digest: ${{ steps.api_push.outputs.digest }}
+      frontend_digest: ${{ steps.fe_push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Tag = short SHA
+        id: meta
+        run: echo "image_tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - name: ACR login
+        run: az acr login --name ${{ vars.ACR_NAME }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Build + push API
+        id: api_push
+        uses: docker/build-push-action@v6
+        with:
+          context: app/api
+          push: true
+          tags: |
+            ${{ vars.ACR_NAME }}.azurecr.io/${{ vars.IMAGE_REPO_API }}:${{ steps.meta.outputs.image_tag }}
+            ${{ vars.ACR_NAME }}.azurecr.io/${{ vars.IMAGE_REPO_API }}:latest
+          provenance: true
+          sbom: true
+      - name: Build + push frontend
+        id: fe_push
+        uses: docker/build-push-action@v6
+        with:
+          context: app/frontend
+          push: true
+          tags: |
+            ${{ vars.ACR_NAME }}.azurecr.io/${{ vars.IMAGE_REPO_FRONTEND }}:${{ steps.meta.outputs.image_tag }}
+            ${{ vars.ACR_NAME }}.azurecr.io/${{ vars.IMAGE_REPO_FRONTEND }}:latest
+          provenance: true
+          sbom: true
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+        with: { cosign-release: "v2.4.0" }
+      - name: Cosign sign (keyless)
+        run: |
+          cosign sign --yes ${{ vars.ACR_NAME }}.azurecr.io/${{ vars.IMAGE_REPO_API }}@${{ steps.api_push.outputs.digest }}
+          cosign sign --yes ${{ vars.ACR_NAME }}.azurecr.io/${{ vars.IMAGE_REPO_FRONTEND }}@${{ steps.fe_push.outputs.digest }}
+      - name: Trivy image scan (API)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ vars.ACR_NAME }}.azurecr.io/${{ vars.IMAGE_REPO_API }}:${{ steps.meta.outputs.image_tag }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+  # ---------- 5. Deploy + smoke + audit ----------
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - uses: azure/setup-helm@v4
+        with: { version: "${{ env.HELM_VERSION }}" }
+      - uses: azure/setup-kubectl@v4
+        with: { version: "${{ env.KUBECTL_VERSION }}" }
+      - name: Get kubeconfig
+        run: az aks get-credentials -n ${{ vars.AKS_CLUSTER_NAME }} -g ${{ vars.RESOURCE_GROUP }} --overwrite-existing
+      - name: Compute sslip.io host from ingress IP
+        id: host
+        run: |
+          IP=$(kubectl get svc ingress-nginx-controller -n ingress-nginx -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          echo "host=app.${IP//./-}.sslip.io" >> "$GITHUB_OUTPUT"
+      - name: helm upgrade
+        run: |
+          helm upgrade --install notes ./charts/notes -n app --create-namespace \
+            --set image.repository=${{ vars.ACR_NAME }}.azurecr.io \
+            --set frontend.tag=${{ needs.build.outputs.image_tag }} \
+            --set api.tag=${{ needs.build.outputs.image_tag }} \
+            --set postgres.host=${{ vars.PG_HOST }} \
+            --set postgres.user=pgadmin \
+            --set keyVault.name=${{ vars.KEY_VAULT_NAME }} \
+            --set keyVault.tenantId=${{ secrets.AZURE_TENANT_ID }} \
+            --set workloadIdentityClientId=${{ vars.APP_CLIENT_ID }} \
+            --set ingress.host=${{ steps.host.outputs.host }} \
+            --wait --timeout 5m
+      - name: Smoke test
+        run: |
+          for i in $(seq 1 10); do
+            if curl -fsSL "https://${{ steps.host.outputs.host }}/api/healthz"; then echo "Healthy"; exit 0; fi
+            sleep 6
+          done
+          exit 1
+      - name: Comment on commit
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.repos.createCommitComment({
+              owner: context.repo.owner, repo: context.repo.repo, commit_sha: context.sha,
+              body: `Deployed tag \`${{ needs.build.outputs.image_tag }}\` to https://${{ steps.host.outputs.host }} (api digest \`${{ needs.build.outputs.api_digest }}\`)`
+            })

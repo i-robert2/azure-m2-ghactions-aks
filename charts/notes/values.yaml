@@ -1,0 +1,44 @@
+# All values below are overridden at install time via --set (see README).
+namespace: app
+
+image:
+  repository: REPLACE.azurecr.io # ACR login server
+  pullPolicy: IfNotPresent
+
+frontend:
+  image: notes-frontend
+  tag: "0.1.0"
+  replicas: 1
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 200m, memory: 128Mi }
+
+api:
+  image: notes-api
+  tag: "0.1.0"
+  replicas: 1
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+  hpa:
+    minReplicas: 1
+    maxReplicas: 4
+    targetCPU: 70
+
+postgres:
+  host: REPLACE.postgres.database.azure.com
+  database: appdb
+  user: pgadmin
+
+ingress:
+  host: REPLACE.sslip.io
+  className: nginx
+  tlsSecretName: app-tls
+  clusterIssuer: letsencrypt-prod
+
+keyVault:
+  name: REPLACE
+  tenantId: REPLACE
+
+# Client ID of the user-assigned identity federated to the notes-api SA.
+workloadIdentityClientId: REPLACE
