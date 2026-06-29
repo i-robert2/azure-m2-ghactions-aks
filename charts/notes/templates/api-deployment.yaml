@@ -21,6 +21,12 @@ spec:
         - name: api
           image: "{{ .Values.image.repository }}/{{ .Values.api.image }}:{{ .Values.api.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           ports:
             - containerPort: 3000
           env:

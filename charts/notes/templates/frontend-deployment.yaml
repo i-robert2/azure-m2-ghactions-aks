@@ -19,6 +19,12 @@ spec:
         - name: frontend
           image: "{{ .Values.image.repository }}/{{ .Values.frontend.image }}:{{ .Values.frontend.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 101
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           ports:
             - containerPort: 8080
           resources:
