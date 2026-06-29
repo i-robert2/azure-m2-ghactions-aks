@@ -73,7 +73,21 @@ terraform/                    M1 base infra (re-apply target, key m2.tfstate)
 2. Federate OIDC for this repo, grant AcrPush + AKS roles, set the secrets/vars above.
 3. SonarCloud: import the repo, create `SONAR_TOKEN`.
 4. `git push` → watch `gh run watch`.
-5. Install Kyverno + apply `kyverno-policies/verify-cosign.yaml` (subject = this repo's `cd.yml@refs/heads/main`).
+5. Install Kyverno, give it an ACR pull credential (so it can fetch signatures from the **private** registry), and apply the policy:
+
+```bash
+helm repo add kyverno https://kyverno.github.io/kyverno && helm repo update
+helm upgrade --install kyverno kyverno/kyverno -n kyverno --create-namespace --wait
+
+# scoped pull token -> docker-registry secret in the kyverno namespace
+PW=$(az acr token credential generate -n kyvernopull -r acrm1devsdc001 --password1 --query "passwords[0].value" -o tsv)
+kubectl create secret docker-registry kyverno-acr -n kyverno \
+  --docker-server=acrm1devsdc001.azurecr.io --docker-username=kyvernopull --docker-password=$PW
+
+kubectl apply -f kyverno-policies/verify-cosign.yaml   # subject = this repo's cd.yml@refs/heads/main
+```
+
+> The policy matches `imageReferences: ["*"]` in the `app` namespace, so **every** pod image must carry a Cosign signature from this workflow. `imageRegistryCredentials.secrets: [kyverno-acr]` lets Kyverno authenticate to the private ACR; Kyverno mutates each verified image to its digest on admission. An unsigned image (e.g. `nginx`) is rejected.
 
 ```bash
 cosign verify acrm1devsdc001.azurecr.io/notes-api:<sha> \
@@ -100,7 +114,7 @@ helm history notes -n app && helm rollback notes <prev> -n app --wait --timeout 
 
 - **No long-lived Azure secret** — OIDC federation only.
 - **Keyless signing** — Cosign uses the GH OIDC identity; signatures + Rekor transparency log, no key to store.
-- **Admission enforcement** — Kyverno rejects pods whose images aren't signed by *this* workflow identity.
+- **Admission enforcement** — Kyverno rejects pods whose images aren't signed by *this* workflow identity. It reads signatures from the private ACR via a scoped, read-only pull token (`kyverno-acr`).
 - **Supply-chain scanning** — Trivy fs + image gates on HIGH/CRITICAL; SBOM published as artifact.
 - **Least-privilege roles** — SP gets AcrPush + AKS user/RBAC scoped to M1's resources only.
 

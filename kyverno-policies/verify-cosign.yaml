@@ -15,7 +15,11 @@ spec:
               namespaces: [app]
       verifyImages:
         - imageReferences:
-            - "acrm1devsdc001.azurecr.io/notes-*:*"
+            - "*"
+          imageRegistryCredentials:
+            allowInsecureRegistry: false
+            secrets:
+              - kyverno-acr
           attestors:
             - count: 1
               entries:
