@@ -137,9 +137,45 @@ helm history notes -n app && helm rollback notes <prev> -n app --wait --timeout 
 
 ---
 
-## Cost
+## Issues we hit (and how we fixed them)
 
-0–3 €/mo on top of M1 (Actions free on public repos, Kyverno + Sonar + Sigstore free, signatures negligible). Deploy-verify-destroy ~€1–2; `terraform destroy` returns spend to ~€0.
+Real problems from wiring this pipeline up for real — the root-cause/fix is the useful part.
+
+### Kyverno couldn't verify images from the private ACR (the big one)
+**Symptom:** Every pod in `app` was denied: `failed to verify image … UNAUTHORIZED: authentication required`. Even our correctly-signed images were blocked.
+**Cause:** Kyverno's `verifyImages` has to **pull the signature from the registry**, but the ACR is private and Kyverno has no credentials by default. A later red herring — "missing digest for …:tag" — was actually the *same* auth failure: with no auth, Kyverno can't resolve the tag→digest it needs.
+**Fix:** Created a **repository-scoped ACR pull token** (`az acr token create … --scope-map _repositories_pull`), stored it as a `docker-registry` secret in the `kyverno` namespace, and referenced it from the policy via `verifyImages.imageRegistryCredentials.secrets: [kyverno-acr]`. Once auth worked, the default `mutateDigest: true` resolved tag→digest and admitted the signed images. Lesson: **don't disable `mutateDigest`/`required` to chase "missing digest" — fix the auth.**
+
+### Policy let an unsigned `nginx` through
+**Symptom:** `kubectl run unsigned --image=nginx` was **allowed**, defeating the point.
+**Cause:** The policy's `imageReferences` only matched `notes-*` images, so nginx matched no rule and was admitted unverified.
+**Fix:** Changed `imageReferences` to `["*"]` so **every** image in `app` must carry a signature from this workflow. Unsigned images are now rejected; ours pass.
+
+### Trivy blocked the build on base-image CVEs
+**Symptom:** The image scan failed with HIGH CVEs in `libcrypto3`, plus `cross-spawn`/`glob`/`minimatch`/`tar`.
+**Cause:** The CVEs were in the **base image** — Alpine's openssl and the `npm` CLI's own bundled `node_modules`, not our app code.
+**Fix:** In the Dockerfiles' final stage: `apk upgrade --no-cache` (fixes openssl) and `rm -rf /usr/local/lib/node_modules/npm` (the runtime doesn't need npm, and it carried the rest). Scan went clean.
+
+### PowerShell mangled the federated-credential subjects
+**Symptom:** `azure/login` failed: `AADSTS700213: No matching federated identity record` even though the creds "existed". Inspecting them showed subjects like `repo:/heads/main`.
+**Cause:** Building the credential JSON inline in PowerShell (colons in `repo:…:ref:refs/heads/main`) corrupted the `subject` string.
+**Fix:** Wrote each credential to an **ASCII JSON file** and passed `@file.json` to `az ad app federated-credential create`, then verified the exact subjects. Also added an `environment:production` credential since the deploy job runs in that environment.
+
+### kube-linter failed on root containers
+**Symptom:** The lint gate failed: containers "not set to runAsNonRoot".
+**Cause:** The images already run as non-root, but the chart never declared it.
+**Fix:** Added a `securityContext` (`runAsNonRoot: true`, the image's real UID — `10001` for the API, `101` for the unprivileged nginx — `allowPrivilegeEscalation: false`, `drop: [ALL]`) to both deployments.
+
+### Deploy step couldn't post its audit comment
+**Symptom:** The deploy succeeded but the "comment on commit" step failed with `403 Resource not accessible by integration`.
+**Cause:** The workflow token defaulted to `contents: read`; creating a commit comment needs write.
+**Fix:** Set `permissions: contents: write` in the workflow.
+
+> Plus the carried-over ones from earlier projects: the dead Trivy action tag (use `@v0.36.0`) and `az acr login` needing Docker (use `--expose-token` + `cosign login` for local verification).
+
+---
+
+## Cost
 
 ---
 
